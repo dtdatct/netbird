@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -53,6 +54,7 @@ type Provider struct {
 	grpcListener net.Listener
 	storage      storage.Storage
 	logger       *slog.Logger
+	loginLimiter atomic.Pointer[LoginThrottle]
 	mu           sync.Mutex
 	running      bool
 }
@@ -135,12 +137,14 @@ func NewProvider(ctx context.Context, config *Config) (*Provider, error) {
 		return nil, fmt.Errorf("failed to create dex server: %w", err)
 	}
 
-	return &Provider{
+	provider := &Provider{
 		config:    config,
 		dexServer: dexSrv,
 		storage:   stor,
 		logger:    logger,
-	}, nil
+	}
+	provider.loginLimiter.Store(NewLoginThrottle(nil))
+	return provider, nil
 }
 
 // NewProviderFromYAML creates and initializes the Dex server from a YAMLConfig
@@ -192,13 +196,15 @@ func NewProviderFromYAML(ctx context.Context, yamlConfig *YAMLConfig) (*Provider
 		return nil, fmt.Errorf("failed to create dex server: %w", err)
 	}
 
-	return &Provider{
+	provider := &Provider{
 		config:     &Config{Issuer: yamlConfig.Issuer, GRPCAddr: yamlConfig.GRPC.Addr},
 		yamlConfig: yamlConfig,
 		dexServer:  dexSrv,
 		storage:    stor,
 		logger:     logger,
-	}, nil
+	}
+	provider.loginLimiter.Store(NewLoginThrottle(nil))
+	return provider, nil
 }
 
 func getSigner(ctx context.Context, stor storage.Storage, yamlConfig *YAMLConfig, logger *slog.Logger) (signer.Signer, error) {
@@ -550,8 +556,19 @@ func (p *Provider) SetClientsMFAChain(ctx context.Context, clientIDs []string, m
 	return SetClientsMFAChain(ctx, p.storage, clientIDs, mfaChain)
 }
 
+// SetLoginThrottleConfig replaces the local login throttle configuration, so
+// that deployment-specific settings such as trusted proxies take effect. It is
+// safe to call while the handler is serving traffic; failure state is reset.
+func (p *Provider) SetLoginThrottleConfig(cfg *LoginThrottleConfig) {
+	p.loginLimiter.Store(NewLoginThrottle(cfg))
+}
+
 // Handler returns the Dex server as an http.Handler for embedding in another server.
 // The handler expects requests with path prefix "/oauth2/".
+//
+// The embedded IdP is served from this handler directly and never passes through
+// the management API middleware, so it carries none of the API rate limiting.
+// Credential submissions to a connector login form are therefore throttled here.
 func (p *Provider) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Dex's /logout endpoint requires id_token_hint for RP-initiated logout with
@@ -562,8 +579,50 @@ func (p *Provider) Handler() http.Handler {
 			return
 		}
 
+		if limiter := p.loginLimiter.Load(); limiter != nil && isLocalLoginSubmission(r) {
+			p.serveThrottledLogin(limiter, w, r)
+			return
+		}
+
 		p.dexServer.ServeHTTP(w, r)
 	})
+}
+
+// serveThrottledLogin serves a local connector credential submission, applying
+// per-account lockout and per-address failure budgets. Both controls draw down
+// only on failures: a successful sign-in clears the account's failure streak,
+// and consuming a form body is avoided for requests that are already refused.
+func (p *Provider) serveThrottledLogin(limiter *LoginThrottle, w http.ResponseWriter, r *http.Request) {
+	// Dex reads the submitted login from the form body, so the body has to be
+	// parsed before the account can be used as a throttle key.
+	if err := r.ParseForm(); err != nil {
+		p.dexServer.ServeHTTP(w, r)
+		return
+	}
+
+	clientIP := limiter.clientIP(r)
+	account := r.PostFormValue("login")
+
+	if retryAfter, allowed := limiter.Check(clientIP, account); !allowed {
+		p.logger.Warn("local login throttled",
+			"account_key", loginAccountLogKey(account),
+			"client_ip", clientIP,
+			"retry_after_seconds", int(retryAfter.Seconds()))
+		writeLoginThrottled(w, retryAfter)
+		return
+	}
+
+	recorder := &statusRecorder{ResponseWriter: w}
+	p.dexServer.ServeHTTP(recorder, r)
+
+	switch {
+	case recorder.status == 0:
+		// Nothing was written, so Dex could not have processed the credentials.
+	case loginSucceeded(recorder.status):
+		limiter.RecordSuccess(account)
+	default:
+		limiter.RecordFailure(clientIP, account)
+	}
 }
 
 // CreateUser creates a new user with the given email, username, and password.

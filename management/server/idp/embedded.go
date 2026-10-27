@@ -425,6 +425,12 @@ func NewEmbeddedIdPManager(ctx context.Context, config *EmbeddedIdPConfig, appMe
 	}, nil
 }
 
+// SetLoginThrottleConfig configures the throttling applied to password
+// submissions on the embedded IdP's local login form.
+func (m *EmbeddedIdPManager) SetLoginThrottleConfig(cfg *dex.LoginThrottleConfig) {
+	m.provider.SetLoginThrottleConfig(cfg)
+}
+
 // Handler returns the HTTP handler for serving OIDC requests.
 func (m *EmbeddedIdPManager) Handler() http.Handler {
 	return m.provider.Handler()

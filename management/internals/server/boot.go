@@ -25,6 +25,7 @@ import (
 
 	"github.com/netbirdio/netbird/encryption"
 	"github.com/netbirdio/netbird/formatter/hook"
+	"github.com/netbirdio/netbird/idp/dex"
 	"github.com/netbirdio/netbird/management/internals/modules/agentnetwork"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/accesslogs"
 	accesslogsmanager "github.com/netbirdio/netbird/management/internals/modules/reverseproxy/accesslogs/manager"
@@ -49,6 +50,7 @@ import (
 	"github.com/netbirdio/netbird/management/server/types"
 	mgmtProto "github.com/netbirdio/netbird/shared/management/proto"
 	"github.com/netbirdio/netbird/shared/ratelimit"
+	"github.com/netbirdio/netbird/trustedproxy"
 	"github.com/netbirdio/netbird/util/crypt"
 )
 
@@ -222,6 +224,17 @@ func (s *BaseServer) IDPHandler() http.Handler {
 	if !ok || embeddedIdP == nil {
 		return nil
 	}
+
+	// The embedded IdP is served from this handler and does not pass through the
+	// API middleware, so the local login form needs its own throttling. Trust the
+	// same upstream proxies the API middleware trusts, so that the per-address
+	// budget keys on the real client instead of the proxy.
+	if proxies := s.Config.ReverseProxy.TrustedHTTPProxies; len(proxies) > 0 {
+		embeddedIdP.SetLoginThrottleConfig(&dex.LoginThrottleConfig{
+			TrustedProxies: trustedproxy.FromPrefixes(proxies),
+		})
+	}
+
 	return cors.AllowAll().Handler(embeddedIdP.Handler())
 }
 
